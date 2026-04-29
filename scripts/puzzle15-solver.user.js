@@ -10,15 +10,55 @@
 
 (function () {
   'use strict';
-  if (!/^\/puzzle15(?:$|[/?#])/.test(location.pathname)) return;
   const LOG = (...args) => console.log('[puzzle15-solver]', ...args);
   const SCRIPT_NS = 'p15-solver';
+  const PAGE_POLL_MS = 1000;
+  const LOCK_KEY = 'subhdd:puzzle15:active-session';
   const PAGE_ID_KEY = `${SCRIPT_NS}:page-id`;
   const BOUND_SESSION_KEY = `${SCRIPT_NS}:bound-session`;
   const LOCKS_KEY = `${SCRIPT_NS}:session-locks`;
   const LOCK_HEARTBEAT_MS = 15000;
   const LOCK_STALE_MS = 120000;
-  const SOLVER_TO_API_DIRECTION = { up: 'down', down: 'up', left: 'right', right: 'left' };
+
+
+  const PANEL_PAGE_KEY = `${SCRIPT_NS}:panel-page`;
+  const PANEL_HIDDEN_KEY = `${SCRIPT_NS}:panel-hidden`;
+  const PAGE_KIND_HUB = 'hub';
+  const PAGE_KIND_GAME = 'game';
+
+  function getPageKind() {
+    const path = location.pathname.toLowerCase();
+    if (path.includes('/custom/hub-entry')) return PAGE_KIND_HUB;
+    return PAGE_KIND_GAME;
+  }
+
+  function readPanelPageKind() {
+    const store = getSessionStore();
+    return store ? (store.getItem(PANEL_PAGE_KEY) || '') : '';
+  }
+
+  function writePanelPageKind(kind) {
+    const store = getSessionStore();
+    if (store) store.setItem(PANEL_PAGE_KEY, kind);
+  }
+
+  function isPanelHidden() {
+    const store = getSessionStore();
+    return store ? store.getItem(PANEL_HIDDEN_KEY) === '1' : false;
+  }
+
+  function setPanelHidden(hidden) {
+    const store = getSessionStore();
+    if (!store) return;
+    if (hidden) store.setItem(PANEL_HIDDEN_KEY, '1');
+    else store.removeItem(PANEL_HIDDEN_KEY);
+  }
+
+  function restorePanelVisibility(panel) {
+    if (!panel) return;
+    panel.style.display = isPanelHidden() ? 'none' : '';
+  }
+
 
   function getSessionStore() {
     try { return window.sessionStorage; } catch { return null; }
@@ -181,10 +221,13 @@
     };
     const OPPOSITE = { up: 'down', down: 'up', left: 'right', right: 'left' };
     const GOAL_CACHE = new Map();
+    const GOAL_POS_CACHE = new Map();
+    const NEIGHBOR_CACHE = new Map();
+    const MANHATTAN_TABLE_CACHE = new Map();
     const SOLVER_LIMITS = {
-      3: { exactMs: 10000, exactDepth: 40, beamMs: 2000, beamWidth: 4000, seenCap: 30000 },
-      4: { exactMs: 45000, exactDepth: 100, beamMs: 5000, beamWidth: 12000, seenCap: 120000 },
-      5: { exactMs: 0, exactDepth: 0, beamMs: 12000, beamWidth: 18000, seenCap: 220000 },
+      3: { exactMs: 18000, exactDepth: 50, weightedMs: 1200, weight: 1.08, queueCap: 16000, seenCap: 80000, beamMs: 1200, beamWidth: 3000 },
+      4: { exactMs: 65000, exactDepth: 100, weightedMs: 9000, weight: 1.22, queueCap: 70000, seenCap: 320000, beamMs: 7000, beamWidth: 14000 },
+      5: { exactMs: 0, exactDepth: 0, weightedMs: 14000, weight: 1.65, queueCap: 140000, seenCap: 520000, beamMs: 12000, beamWidth: 22000 },
     };
 
     function flatten(board) {
@@ -211,8 +254,61 @@
       return goalFlat(size).join(',');
     }
 
+    function goalPositions(size) {
+      if (!GOAL_POS_CACHE.has(size)) {
+        const total = size * size;
+        const out = new Int16Array(total * 2);
+        for (let tile = 1; tile < total; tile++) {
+          out[tile * 2] = Math.floor((tile - 1) / size);
+          out[(tile * 2) + 1] = (tile - 1) % size;
+        }
+        GOAL_POS_CACHE.set(size, out);
+      }
+      return GOAL_POS_CACHE.get(size);
+    }
+
+    function moveTable(size) {
+      if (!NEIGHBOR_CACHE.has(size)) {
+        const out = [];
+        for (let idx = 0; idx < size * size; idx++) {
+          const row = Math.floor(idx / size);
+          const col = idx % size;
+          const moves = [];
+          for (const dir of DIRECTION_ORDER) {
+            const move = MOVE_VECTORS[dir];
+            const nr = row + move.dr;
+            const nc = col + move.dc;
+            if (nr < 0 || nr >= size || nc < 0 || nc >= size) continue;
+            moves.push({ dir, index: (nr * size) + nc });
+          }
+          out[idx] = moves;
+        }
+        NEIGHBOR_CACHE.set(size, out);
+      }
+      return NEIGHBOR_CACHE.get(size);
+    }
+
+    function manhattanTable(size) {
+      if (!MANHATTAN_TABLE_CACHE.has(size)) {
+        const total = size * size;
+        const table = new Uint16Array(total * total);
+        for (let tile = 1; tile < total; tile++) {
+          const goalR = Math.floor((tile - 1) / size);
+          const goalC = (tile - 1) % size;
+          const offset = tile * total;
+          for (let pos = 0; pos < total; pos++) {
+            const row = Math.floor(pos / size);
+            const col = pos % size;
+            table[offset + pos] = Math.abs(row - goalR) + Math.abs(col - goalC);
+          }
+        }
+        MANHATTAN_TABLE_CACHE.set(size, table);
+      }
+      return MANHATTAN_TABLE_CACHE.get(size);
+    }
+
     function boardKey(flat) {
-      return flat.join(',');
+      return Array.from(flat).join(',');
     }
 
     function isGoalFlat(flat) {
@@ -223,15 +319,12 @@
     }
 
     function manhattan(flat, size) {
+      const total = size * size;
+      const table = manhattanTable(size);
       let dist = 0;
-      for (let i = 0; i < flat.length; i++) {
-        const v = flat[i];
-        if (v === 0) continue;
-        const goalR = Math.floor((v - 1) / size);
-        const goalC = (v - 1) % size;
-        const curR = Math.floor(i / size);
-        const curC = i % size;
-        dist += Math.abs(curR - goalR) + Math.abs(curC - goalC);
+      for (let pos = 0; pos < flat.length; pos++) {
+        const tile = flat[pos];
+        if (tile) dist += table[(tile * total) + pos];
       }
       return dist;
     }
@@ -287,8 +380,9 @@
       return penalty;
     }
 
-    function heuristic(flat, size) {
-      return manhattan(flat, size) + linearConflict(flat, size) + cornerConflict(flat, size);
+    function heuristic(flat, size, baseManhattan) {
+      const md = Number.isFinite(baseManhattan) ? baseManhattan : manhattan(flat, size);
+      return md + linearConflict(flat, size) + cornerConflict(flat, size);
     }
 
     function isSolvable(flat, size) {
@@ -331,54 +425,98 @@
       return out;
     }
 
+    class MinHeap {
+      constructor(compare) {
+        this.compare = compare;
+        this.data = [];
+      }
+
+      get size() {
+        return this.data.length;
+      }
+
+      push(item) {
+        const data = this.data;
+        data.push(item);
+        let idx = data.length - 1;
+        while (idx > 0) {
+          const parent = (idx - 1) >> 1;
+          if (this.compare(data[idx], data[parent]) >= 0) break;
+          [data[idx], data[parent]] = [data[parent], data[idx]];
+          idx = parent;
+        }
+      }
+
+      pop() {
+        const data = this.data;
+        if (!data.length) return null;
+        const top = data[0];
+        const last = data.pop();
+        if (data.length) {
+          data[0] = last;
+          let idx = 0;
+          while (true) {
+            const left = (idx * 2) + 1;
+            const right = left + 1;
+            let best = idx;
+            if (left < data.length && this.compare(data[left], data[best]) < 0) best = left;
+            if (right < data.length && this.compare(data[right], data[best]) < 0) best = right;
+            if (best === idx) break;
+            [data[idx], data[best]] = [data[best], data[idx]];
+            idx = best;
+          }
+        }
+        return top;
+      }
+    }
+
     function exactSolve(board, size, timeBudgetMs, depthLimit) {
       if (!timeBudgetMs || !depthLimit) {
         return { ok: false, reason: 'skipped_exact', sequence: [], stats: { algorithm: 'ida*', timeMs: 0 } };
       }
       const flat = flatten(board);
       if (!isSolvable(flat, size)) return { ok: false, reason: 'unsolvable', sequence: [], stats: {} };
-      const t0 = Date.now();
+      if (isGoalFlat(flat)) return { ok: true, sequence: [], stats: { algorithm: 'ida*', timeMs: 0, iterations: 0, steps: 0 } };
+
+      const total = size * size;
+      const table = manhattanTable(size);
       const state = new Uint8Array(flat);
+      const neighborMoves = moveTable(size);
+      const t0 = Date.now();
       const blankIdx = flat.indexOf(0);
       let threshold = heuristic(state, size);
       let iterations = 0;
 
-      function dfs(g, bound, blankPos, lastDir, path) {
+      function dfs(g, bound, blankPos, lastDir, path, currentManhattan) {
         if (Date.now() - t0 > timeBudgetMs) return { status: 'timeout' };
-        const h = heuristic(state, size);
+        const h = heuristic(state, size, currentManhattan);
         const f = g + h;
         if (f > bound) return { status: 'bound', value: f };
         if (h === 0) return { status: 'found', path: path.slice() };
         if (g >= depthLimit) return { status: 'bound', value: Infinity };
 
         let nextBound = Infinity;
-        const br = Math.floor(blankPos / size);
-        const bc = blankPos % size;
         const candidates = [];
-        for (const dir of DIRECTION_ORDER) {
-          if (lastDir && OPPOSITE[dir] === lastDir) continue;
-          const move = MOVE_VECTORS[dir];
-          const nr = br + move.dr;
-          const nc = bc + move.dc;
-          if (nr < 0 || nr >= size || nc < 0 || nc >= size) continue;
-          const nIdx = nr * size + nc;
-          const movedTile = state[nIdx];
+        for (const move of neighborMoves[blankPos]) {
+          if (lastDir && OPPOSITE[move.dir] === lastDir) continue;
+          const movedTile = state[move.index];
+          const nextManhattan = currentManhattan - table[(movedTile * total) + move.index] + table[(movedTile * total) + blankPos];
           state[blankPos] = movedTile;
-          state[nIdx] = 0;
-          const nextH = heuristic(state, size);
-          state[nIdx] = movedTile;
+          state[move.index] = 0;
+          const nextH = heuristic(state, size, nextManhattan);
+          state[move.index] = movedTile;
           state[blankPos] = 0;
-          candidates.push({ dir, nIdx, movedTile, score: nextH });
+          candidates.push({ dir: move.dir, index: move.index, movedTile, nextManhattan, score: nextH });
         }
         candidates.sort((a, b) => a.score - b.score || a.movedTile - b.movedTile);
 
         for (const candidate of candidates) {
           state[blankPos] = candidate.movedTile;
-          state[candidate.nIdx] = 0;
+          state[candidate.index] = 0;
           path.push(candidate.dir);
-          const result = dfs(g + 1, bound, candidate.nIdx, candidate.dir, path);
+          const result = dfs(g + 1, bound, candidate.index, candidate.dir, path, candidate.nextManhattan);
           path.pop();
-          state[candidate.nIdx] = candidate.movedTile;
+          state[candidate.index] = candidate.movedTile;
           state[blankPos] = 0;
           if (result.status === 'found' || result.status === 'timeout') return result;
           if (result.value < nextBound) nextBound = result.value;
@@ -386,9 +524,11 @@
         return { status: 'bound', value: nextBound };
       }
 
+      let currentThreshold = threshold;
+      let currentManhattan = manhattan(state, size);
       while (iterations < 2000) {
         iterations += 1;
-        const result = dfs(0, threshold, blankIdx, null, []);
+        const result = dfs(0, currentThreshold, blankIdx, null, [], currentManhattan);
         if (result.status === 'found') {
           return { ok: true, sequence: result.path, stats: { algorithm: 'ida*', timeMs: Date.now() - t0, iterations, steps: result.path.length } };
         }
@@ -398,9 +538,84 @@
         if (!Number.isFinite(result.value)) {
           return { ok: false, reason: 'depth_limit', sequence: [], stats: { algorithm: 'ida*', timeMs: Date.now() - t0, iterations } };
         }
-        threshold = result.value;
+        currentThreshold = result.value;
       }
       return { ok: false, reason: 'max_iterations', sequence: [], stats: { algorithm: 'ida*', timeMs: Date.now() - t0, iterations } };
+    }
+
+    function weightedAStarSolve(board, size, options) {
+      const flat = flatten(board);
+      if (!isSolvable(flat, size)) return { ok: false, reason: 'unsolvable', sequence: [], stats: {} };
+      if (isGoalFlat(flat)) return { ok: true, sequence: [], stats: { algorithm: 'weighted-a*', timeMs: 0, steps: 0 } };
+
+      const t0 = Date.now();
+      const total = size * size;
+      const table = manhattanTable(size);
+      const neighborMoves = moveTable(size);
+      const startKey = boardKey(flat);
+      const open = new MinHeap((a, b) => a.f - b.f || a.h - b.h || a.g - b.g);
+      const parents = new Map([[startKey, { parent: null, move: null }]]);
+      const bestG = new Map([[startKey, 0]]);
+      const weight = options.weight || 1.5;
+      const queueCap = options.queueCap || 50000;
+      const seenCap = options.seenCap || 200000;
+      const timeBudgetMs = options.weightedMs || options.beamMs || 4000;
+
+      const startManhattan = manhattan(flat, size);
+      const startH = heuristic(flat, size, startManhattan);
+      open.push({ flat: new Uint8Array(flat), blankIdx: flat.indexOf(0), g: 0, h: startH, md: startManhattan, f: startH * weight, key: startKey, lastDir: null });
+
+      let expanded = 0;
+
+      while (open.size) {
+        if (Date.now() - t0 > timeBudgetMs) {
+          return { ok: false, reason: 'timeout', sequence: [], stats: { algorithm: 'weighted-a*', timeMs: Date.now() - t0, expanded, open: open.size } };
+        }
+
+        const node = open.pop();
+        if (!node) break;
+        const bestKnown = bestG.get(node.key);
+        if (bestKnown !== node.g) continue;
+        if (node.h === 0 || isGoalFlat(node.flat)) {
+          const sequence = reconstructMoves(parents, node.key, startKey) || [];
+          return { ok: true, sequence: sequence.map((dir) => OPPOSITE[dir]), stats: { algorithm: 'weighted-a*', timeMs: Date.now() - t0, expanded, steps: sequence.length, open: open.size } };
+        }
+
+        expanded += 1;
+        for (const move of neighborMoves[node.blankIdx]) {
+          if (node.lastDir && OPPOSITE[move.dir] === node.lastDir) continue;
+          const nextFlat = node.flat.slice();
+          const movedTile = nextFlat[move.index];
+          nextFlat[node.blankIdx] = movedTile;
+          nextFlat[move.index] = 0;
+          const nextKey = boardKey(nextFlat);
+          const nextG = node.g + 1;
+          const prevG = bestG.get(nextKey);
+          if (prevG !== undefined && prevG <= nextG) continue;
+
+          const nextManhattan = node.md - table[(movedTile * total) + move.index] + table[(movedTile * total) + node.blankIdx];
+          const nextH = heuristic(nextFlat, size, nextManhattan);
+          bestG.set(nextKey, nextG);
+          parents.set(nextKey, { parent: node.key, move: move.dir });
+          open.push({ flat: nextFlat, blankIdx: move.index, g: nextG, h: nextH, md: nextManhattan, f: nextG + (weight * nextH), key: nextKey, lastDir: move.dir });
+        }
+
+        if (bestG.size > seenCap) {
+          const survivors = new Map();
+          const frontier = open.data.slice().sort((a, b) => a.f - b.f || a.h - b.h).slice(0, queueCap);
+          for (const item of frontier) survivors.set(item.key, bestG.get(item.key));
+          bestG.clear();
+          for (const [key, value] of survivors) bestG.set(key, value);
+        }
+
+        if (open.size > queueCap * 2) {
+          const kept = open.data.slice().sort((a, b) => a.f - b.f || a.h - b.h).slice(0, queueCap);
+          open.data = [];
+          for (const item of kept) open.push(item);
+        }
+      }
+
+      return { ok: false, reason: 'exhausted', sequence: [], stats: { algorithm: 'weighted-a*', timeMs: Date.now() - t0, expanded, open: open.size } };
     }
 
     function beamBidirectionalSolve(board, size, options) {
@@ -413,16 +628,16 @@
       const startKey = boardKey(flat);
       const goalStateKey = goalKey(size);
       const beamWidth = options.beamWidth;
-      const seenCap = options.seenCap;
       const timeBudgetMs = options.beamMs;
 
       const startParents = new Map([[startKey, { parent: null, move: null }]]);
       const goalParents = new Map([[goalStateKey, { parent: null, move: null }]]);
       const startSeenDepth = new Map([[startKey, 0]]);
       const goalSeenDepth = new Map([[goalStateKey, 0]]);
+      const neighbors = moveTable(size);
 
-      let startFrontier = [{ flat, blankIdx: flat.indexOf(0), g: 0, h: heuristic(flat, size), lastDir: null, key: startKey }];
-      let goalFrontier = [{ flat: goal.slice(), blankIdx: goal.indexOf(0), g: 0, h: 0, lastDir: null, key: goalStateKey }];
+      let startFrontier = [{ flat: new Uint8Array(flat), blankIdx: flat.indexOf(0), g: 0, h: heuristic(flat, size), lastDir: null, key: startKey }];
+      let goalFrontier = [{ flat: new Uint8Array(goal), blankIdx: goal.indexOf(0), g: 0, h: 0, lastDir: null, key: goalStateKey }];
       let expanded = 0;
       let depth = 0;
 
@@ -431,31 +646,23 @@
         let meetKey = null;
         for (const node of frontier) {
           if (Date.now() - t0 > timeBudgetMs) return { timeout: true };
-          const br = Math.floor(node.blankIdx / size);
-          const bc = node.blankIdx % size;
           const candidates = [];
-          for (const dir of DIRECTION_ORDER) {
-            if (node.lastDir && OPPOSITE[dir] === node.lastDir) continue;
-            const move = MOVE_VECTORS[dir];
-            const nr = br + move.dr;
-            const nc = bc + move.dc;
-            if (nr < 0 || nr >= size || nc < 0 || nc >= size) continue;
-            const nIdx = nr * size + nc;
+          for (const move of neighbors[node.blankIdx]) {
+            if (node.lastDir && OPPOSITE[move.dir] === node.lastDir) continue;
             const nextFlat = node.flat.slice();
-            const movedTile = nextFlat[nIdx];
+            const movedTile = nextFlat[move.index];
             nextFlat[node.blankIdx] = movedTile;
-            nextFlat[nIdx] = 0;
+            nextFlat[move.index] = 0;
             const nextKey = boardKey(nextFlat);
             const nextDepth = node.g + 1;
             const prevDepth = seenDepth.get(nextKey);
             if (prevDepth !== undefined && prevDepth <= nextDepth) continue;
             const nextH = heuristic(nextFlat, size);
-            const score = nextDepth + nextH;
-            candidates.push({ flat: nextFlat, blankIdx: nIdx, g: nextDepth, h: nextH, score, lastDir: dir, key: nextKey, move: dir });
+            const score = (nextDepth * 0.35) + nextH;
+            candidates.push({ flat: nextFlat, blankIdx: move.index, g: nextDepth, h: nextH, score, lastDir: move.dir, key: nextKey, move: move.dir });
           }
           candidates.sort((a, b) => a.score - b.score || a.h - b.h);
-          for (let i = 0; i < candidates.length; i++) {
-            const child = candidates[i];
+          for (const child of candidates) {
             seenDepth.set(child.key, child.g);
             parents.set(child.key, { parent: node.key, move: forward ? child.move : OPPOSITE[child.move] });
             if (otherParents.has(child.key)) {
@@ -468,11 +675,6 @@
         }
         next.sort((a, b) => a.score - b.score || a.h - b.h);
         if (next.length > beamWidth) next.length = beamWidth;
-        if (seenDepth.size > seenCap) {
-          const trimmed = new Map();
-          for (const node of next) trimmed.set(node.key, node.g);
-          for (const [key, value] of trimmed) seenDepth.set(key, value);
-        }
         return { next };
       }
 
@@ -492,7 +694,8 @@
           if (!left || !right) {
             return { ok: false, reason: 'reconstruct_failed', sequence: [], stats: { algorithm: 'beam-bidir', timeMs: Date.now() - t0, expanded, depth } };
           }
-          const sequence = left.concat(right);
+          const rightForward = right.slice().reverse().map((dir) => OPPOSITE[dir]);
+          const sequence = left.concat(rightForward).map((dir) => OPPOSITE[dir]);
           return { ok: true, sequence, stats: { algorithm: 'beam-bidir', timeMs: Date.now() - t0, expanded, depth, steps: sequence.length } };
         }
         if (expandStart) startFrontier = result.next;
@@ -503,11 +706,29 @@
 
     function solve2D(board, size) {
       const limits = SOLVER_LIMITS[size] || SOLVER_LIMITS[4];
+      const flat = flatten(board);
+      if (!isSolvable(flat, size)) return { ok: false, reason: 'unsolvable', sequence: [], stats: {} };
+      if (isGoalFlat(flat)) return { ok: true, sequence: [], stats: { algorithm: 'noop', timeMs: 0, steps: 0 } };
+
       const exact = exactSolve(board, size, limits.exactMs, limits.exactDepth);
       if (exact.ok) return exact;
+
       const beam = beamBidirectionalSolve(board, size, limits);
       if (beam.ok) return beam;
-      return exact.stats.timeMs >= beam.stats.timeMs ? exact : beam;
+
+      const weighted = weightedAStarSolve(board, size, limits);
+      if (weighted.ok) return weighted;
+
+      const beamExpanded = beam?.stats?.expanded ?? Number.POSITIVE_INFINITY;
+      const weightedExpanded = weighted?.stats?.expanded ?? Number.POSITIVE_INFINITY;
+      const beamTime = beam?.stats?.timeMs || 0;
+      const weightedTime = weighted?.stats?.timeMs || 0;
+      const exactTime = exact?.stats?.timeMs || 0;
+      if (size >= 5) {
+        if (beam.ok && weighted.ok) return beamExpanded <= weightedExpanded ? beam : weighted;
+        return beam.ok ? beam : weighted;
+      }
+      return Math.max(exactTime, beamTime, weightedTime) === exactTime ? exact : ((beamExpanded <= weightedExpanded) ? beam : weighted);
     }
 
     function solve(board) {
@@ -520,6 +741,7 @@
       solve,
       solve2D,
       exactSolve,
+      weightedAStarSolve,
       beamBidirectionalSolve,
       isSolvable,
       manhattan,
@@ -579,9 +801,36 @@
   // ═══════════════════════════════════════════════════════════════
   //  UI PANEL
   // ═══════════════════════════════════════════════════════════════
-  const panel = document.createElement('div');
-  panel.id = 'p15-solver-panel';
-  panel.innerHTML = `
+  let panel = null;
+  let $log = null;
+  let $info = null;
+  let $boardWrap = null;
+  let $btnStart = null;
+  let $btnSolve = null;
+  let $btnAuto = null;
+  let $btnStop = null;
+  let $progress = null;
+
+  function mountPanel() {
+    if (window.top !== window.self) return null;
+    if (document.getElementById('p15-solver-panel')) {
+      panel = document.getElementById('p15-solver-panel');
+      $log = document.getElementById('p15-log');
+      $info = document.getElementById('p15-info');
+      $boardWrap = document.getElementById('p15-board-wrap');
+      $btnStart = document.getElementById('p15-start');
+      $btnSolve = document.getElementById('p15-solve');
+      $btnAuto = document.getElementById('p15-auto');
+      $btnStop = document.getElementById('p15-stop');
+      $progress = document.getElementById('p15-progress');
+      restorePanelVisibility(panel);
+      writePanelPageKind(getPageKind());
+      return panel;
+    }
+    panel = document.createElement('div');
+    panel.id = 'p15-solver-panel';
+    writePanelPageKind(getPageKind());
+    panel.innerHTML = `
     <style>
       #p15-solver-panel{position:fixed;right:12px;top:12px;bottom:auto;left:auto;z-index:2147483647;background:rgba(30,30,46,.96);color:#cdd6f4;border:1px solid #45475a;border-radius:10px;font-family:monospace;font-size:13px;width:min(360px,calc(100vw - 24px));max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);box-shadow:0 8px 28px rgba(0,0,0,.5);overflow:hidden}
       #p15-solver-panel *{box-sizing:border-box}
@@ -607,7 +856,7 @@
         .p15-log{min-height:88px;max-height:140px}
       }
     </style>
-    <div class="p15-hdr"><span>🧩 华容道求解器</span><button id="p15-toggle" style="background:none;border:none;color:#cdd6f4;cursor:pointer;font-size:16px">−</button></div>
+    <div class="p15-hdr"><span>🧩 华容道求解器</span><span><button id="p15-toggle" style="background:none;border:none;color:#cdd6f4;cursor:pointer;font-size:16px">−</button><button id="p15-close" style="background:none;border:none;color:#cdd6f4;cursor:pointer;font-size:16px">×</button></span></div>
     <div class="p15-body" id="p15-body">
       <div class="p15-btns">
         <select id="p15-diff" style="background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4px;padding:4px 8px;font-size:12px">
@@ -636,31 +885,53 @@
       <div id="p15-board-wrap"></div>
       <div class="p15-log" id="p15-log"></div>
     </div>`;
-  document.body.appendChild(panel);
-  const liveBadge = document.createElement('div');
-  liveBadge.id = 'p15-live-badge';
-  liveBadge.textContent = '华容道脚本: idle';
-  document.body.appendChild(liveBadge);
-  makeDraggable(panel, panel.querySelector('.p15-hdr'));
+    document.body.appendChild(panel);
+    restorePanelVisibility(panel);
+    writePanelPageKind(getPageKind());
+    let liveBadge = document.getElementById('p15-live-badge');
+    if (!liveBadge) {
+      liveBadge = document.createElement('div');
+      liveBadge.id = 'p15-live-badge';
+      liveBadge.textContent = '华容道脚本: idle';
+      document.body.appendChild(liveBadge);
+    }
+    if (liveBadge) liveBadge.style.display = 'none';
+    makeDraggable(panel, panel.querySelector('.p15-hdr'));
+    $log = document.getElementById('p15-log');
+    $info = document.getElementById('p15-info');
+    $boardWrap = document.getElementById('p15-board-wrap');
+    $btnStart = document.getElementById('p15-start');
+    $btnSolve = document.getElementById('p15-solve');
+    $btnAuto = document.getElementById('p15-auto');
+    $btnStop = document.getElementById('p15-stop');
+    $progress = document.getElementById('p15-progress');
+    return panel;
+  }
 
-  const $log = document.getElementById('p15-log');
-  const $info = document.getElementById('p15-info');
-  const $boardWrap = document.getElementById('p15-board-wrap');
-  const $btnStart = document.getElementById('p15-start');
-  const $btnSolve = document.getElementById('p15-solve');
-  const $btnAuto = document.getElementById('p15-auto');
-  const $btnStop = document.getElementById('p15-stop');
-  const $progress = document.getElementById('p15-progress');
+  if (window.top === window.self) mountPanel();
 
-  document.getElementById('p15-toggle').onclick = () => {
-    const b = document.getElementById('p15-body');
-    b.style.display = b.style.display === 'none' ? '' : 'none';
-  };
+  if (panel) {
+    document.getElementById('p15-toggle').onclick = () => {
+      const b = document.getElementById('p15-body');
+      b.style.display = b.style.display === 'none' ? '' : 'none';
+    };
+
+    document.getElementById('p15-close').onclick = () => {
+      setPanelHidden(true);
+      panel.style.display = 'none';
+      const badge = document.getElementById('p15-live-badge');
+      if (badge) badge.style.display = 'none';
+    };
+  }
 
   function setProgress(text) {
     if ($progress) $progress.textContent = text;
     const badge = document.getElementById('p15-live-badge');
     if (badge) badge.textContent = `华容道脚本: ${text}`;
+  }
+
+  function hasMountedPanel() {
+    return !!panel && !!document.getElementById('p15-solver-panel');
   }
 
   function log(msg) { $log.textContent += msg + '\n'; $log.scrollTop = $log.scrollHeight; LOG(msg); }
@@ -743,7 +1014,7 @@
   }
 
   function toApiDirection(dir) {
-    return SOLVER_TO_API_DIRECTION[dir] || dir;
+    return dir;
   }
 
   function inferDifficultyFromSession(sess) {
@@ -1045,7 +1316,7 @@
               for (let i = 0; i < candidates.length; i++) {
                 const child = candidates[i];
                 seenDepth.set(child.key, child.g);
-                parents.set(child.key, { parent: node.key, move: forward ? child.move : OPPOSITE[child.move] });
+                parents.set(child.key, { parent: node.key, move: child.move });
                 if (otherParents.has(child.key)) {
                   meetKey = child.key;
                   return { meetKey, next };
@@ -1075,7 +1346,8 @@
               const left = reconstructMoves(startParents, result.meetKey, startKey);
               const right = reconstructMoves(goalParents, result.meetKey, goalStateKey);
               if (!left || !right) return { ok: false, reason: 'reconstruct_failed', sequence: [], stats: { algorithm: 'beam-bidir', timeMs: Date.now() - t0, expanded, depth } };
-              const sequence = left.concat(right);
+              const rightForward = right.slice().reverse().map((dir) => OPPOSITE[dir]);
+              const sequence = left.concat(rightForward).map((dir) => OPPOSITE[dir]);
               return { ok: true, sequence, stats: { algorithm: 'beam-bidir', timeMs: Date.now() - t0, expanded, depth, steps: sequence.length } };
             }
             if (expandStart) startFrontier = result.next;
@@ -1099,6 +1371,9 @@
   }
 
   async function solveBoardAsync(board) {
+    if (board.length >= 5) {
+      return Puzzle15Solver.solve(board);
+    }
     if (typeof Worker === 'undefined' || typeof Blob === 'undefined' || typeof URL === 'undefined') {
       return Puzzle15Solver.solve(board);
     }
@@ -1208,7 +1483,30 @@
     const elapsed = Date.now() - t0;
     if (result.ok) {
       state.solution = result.sequence.map(toApiDirection);
+      const previewBoard = state.board.map((row) => row.slice());
+      let previewOk = true;
+      for (const dir of state.solution) {
+        try {
+          applyMove(previewBoard, dir);
+        } catch {
+          previewOk = false;
+          break;
+        }
+      }
+      const solvedPreview = previewOk && previewBoard.flat().every((v, idx, arr) => v === (idx + 1) % arr.length);
       state.moveIdx = 0;
+      if (!solvedPreview) {
+        state.solution = null;
+        state.moveIdx = 0;
+        $info.textContent = '求解失败: invalid-sequence';
+        setProgress('solve-failed');
+        log(`求解失败: invalid-sequence (${result.stats.algorithm || 'solver'})`);
+        if (previewOk) log('原因: 序列执行后未到终局');
+        else log('原因: 序列含非法移动');
+        state.solving = false;
+        $btnSolve.disabled = false;
+        return false;
+      }
       $info.textContent = `求解成功! ${result.stats.steps}步  ${elapsed}ms  ${result.stats.algorithm || 'solver'}`;
       setProgress(`ready ${result.stats.steps}`);
       log(`求解成功: ${result.stats.steps} 步, ${elapsed}ms, ${result.stats.algorithm || 'solver'}`);
@@ -1272,13 +1570,18 @@
       const dir = seq[i];
       try {
         const res = await api('POST', '/move', { session_id: state.sessionId, direction: dir });
-        applyMove(state.board, dir);
+        const nextBoard = normalizeBoard(res?.board || res?.session?.board || null);
+        if (nextBoard) state.board = nextBoard;
+        else applyMove(state.board, dir);
         renderBoard(state.board);
         state.moveIdx = i + 1;
         setProgress(`running ${state.moveIdx}/${seq.length}`);
         $info.textContent = `进度: ${i + 1}/${seq.length}  方向: ${dir}  moves: ${res.move_count}`;
         const badge = document.getElementById('p15-live-badge');
-        if (badge) badge.textContent = `华容道脚本: ${i + 1}/${seq.length} ${dir}`;
+        if (badge) {
+          badge.style.display = 'none';
+          badge.textContent = `华容道脚本: ${i + 1}/${seq.length} ${dir}`;
+        }
         log(`执行 ${i + 1}/${seq.length}: ${dir}`);
         if (res.won || (res.session && res.session.status === 'completed')) {
           log(`🎉 完成! 奖励: ${res.session?.reward_amount || '?'}`);
@@ -1324,5 +1627,42 @@
     }, 2600);
   }
 
+  function isPuzzle15Page() {
+    const path = location.pathname.toLowerCase();
+    if (path.includes('/custom/hub-entry')) return false;
+    const text = `${document.title}\n${document.body?.innerText || ''}`;
+    return path.includes('puzzle15') || /华容道|15-puzzle/i.test(text);
+  }
+
+  function ensurePanelVisible() {
+    if (!hasMountedPanel()) {
+      mountPanel();
+    }
+    if (!hasMountedPanel()) return;
+    writePanelPageKind(getPageKind());
+    if (!isPanelHidden()) panel.style.display = '';
+    const badge = document.getElementById('p15-live-badge');
+    if (badge) badge.style.display = isPanelHidden() ? 'none' : '';
+  }
+
+  function watchPage() {
+    let ready = false;
+    const tick = () => {
+      const nowReady = isPuzzle15Page();
+      if (nowReady && !ready) {
+        ready = true;
+        ensurePanelVisible();
+        log('华容道页面就绪');
+        void loadConfig().catch((e) => log('配置加载失败: ' + e.message));
+        void resumeActiveSession();
+      } else if (!nowReady && ready) {
+        ready = false;
+      }
+    };
+    tick();
+    setInterval(tick, PAGE_POLL_MS);
+  }
+
+  watchPage();
   LOG('Userscript loaded');
 })();
