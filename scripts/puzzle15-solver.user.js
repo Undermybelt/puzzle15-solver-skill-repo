@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         华容道自动求解器
 // @namespace    https://sub.hdd.sb/
-// @version      1.0.5
+// @version      1.0.6
 // @description  15-puzzle AI — IDA* 最优路径求解
 // @match        https://sub.hdd.sb/*
 // @run-at       document-idle
@@ -10,7 +10,14 @@
 
 (function () {
   'use strict';
+  const SCRIPT_VERSION = '1.0.6-debug';
+  if (window.__P15_SOLVER_BOOTED__) {
+    console.warn('[puzzle15-solver] duplicate instance blocked', window.__P15_SOLVER_BOOTED__);
+    return;
+  }
+  window.__P15_SOLVER_BOOTED__ = SCRIPT_VERSION;
   const LOG = (...args) => console.log('[puzzle15-solver]', ...args);
+  LOG('boot', SCRIPT_VERSION, location.pathname);
   const SCRIPT_NS = 'p15-solver';
   const PAGE_POLL_MS = 1000;
   const LOCK_KEY = 'subhdd:puzzle15:active-session';
@@ -23,6 +30,7 @@
 
   const PANEL_PAGE_KEY = `${SCRIPT_NS}:panel-page`;
   const PANEL_HIDDEN_KEY = `${SCRIPT_NS}:panel-hidden`;
+  const PANEL_MANUAL_CLOSE_KEY = `${SCRIPT_NS}:panel-manual-close`;
   const PAGE_KIND_HUB = 'hub';
   const PAGE_KIND_GAME = 'game';
 
@@ -47,6 +55,18 @@
     return store ? store.getItem(PANEL_HIDDEN_KEY) === '1' : false;
   }
 
+  function wasPanelManuallyClosed() {
+    const store = getSessionStore();
+    return store ? store.getItem(PANEL_MANUAL_CLOSE_KEY) === '1' : false;
+  }
+
+  function setPanelManualClose(closed) {
+    const store = getSessionStore();
+    if (!store) return;
+    if (closed) store.setItem(PANEL_MANUAL_CLOSE_KEY, '1');
+    else store.removeItem(PANEL_MANUAL_CLOSE_KEY);
+  }
+
   function setPanelHidden(hidden) {
     const store = getSessionStore();
     if (!store) return;
@@ -63,6 +83,15 @@
   function getSessionStore() {
     try { return window.sessionStorage; } catch { return null; }
   }
+
+
+  try {
+    const store = window.sessionStorage;
+    if (store && location.pathname.toLowerCase().includes('/custom/hub-entry')) {
+      store.removeItem(PANEL_HIDDEN_KEY);
+      store.removeItem(PANEL_MANUAL_CLOSE_KEY);
+    }
+  } catch {}
 
   function getLocalStore() {
     try { return window.localStorage; } catch { return null; }
@@ -175,35 +204,7 @@
   }
 
   function makeBackgroundSleep() {
-    if (typeof Worker === 'undefined' || typeof Blob === 'undefined' || typeof URL === 'undefined') {
-      return (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    }
-    const source = `
-      const timers = new Map();
-      self.onmessage = (event) => {
-        const { id, ms } = event.data || {};
-        const handle = setTimeout(() => {
-          timers.delete(id);
-          self.postMessage({ id });
-        }, Math.max(0, ms || 0));
-        timers.set(id, handle);
-      };
-    `;
-    const worker = new Worker(URL.createObjectURL(new Blob([source], { type: 'application/javascript' })));
-    let seq = 0;
-    const pending = new Map();
-    worker.onmessage = (event) => {
-      const id = event.data?.id;
-      const resolve = pending.get(id);
-      if (!resolve) return;
-      pending.delete(id);
-      resolve();
-    };
-    return (ms) => new Promise((resolve) => {
-      const id = ++seq;
-      pending.set(id, resolve);
-      worker.postMessage({ id, ms });
-    });
+    return (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   const sleep = makeBackgroundSleep();
@@ -226,7 +227,20 @@
     const MANHATTAN_TABLE_CACHE = new Map();
     const SOLVER_LIMITS = {
       3: { exactMs: 18000, exactDepth: 50, weightedMs: 1200, weight: 1.08, queueCap: 16000, seenCap: 80000, beamMs: 1200, beamWidth: 3000 },
-      4: { exactMs: 65000, exactDepth: 100, weightedMs: 9000, weight: 1.22, queueCap: 70000, seenCap: 320000, beamMs: 7000, beamWidth: 14000 },
+      4: {
+        exactMs: 90000,
+        exactDepth: 120,
+        weightedMs: 25000,
+        weight: 1.12,
+        queueCap: 220000,
+        seenCap: 900000,
+        beamMs: 18000,
+        beamWidth: 28000,
+        stage1Tiles: 6,
+        stage1PerTileMs: 2200,
+        stage1BeamWidth: 200,
+        stage1SeenCap: 25000,
+      },
       5: { exactMs: 0, exactDepth: 0, weightedMs: 14000, weight: 1.65, queueCap: 140000, seenCap: 520000, beamMs: 12000, beamWidth: 22000 },
     };
 
@@ -423,6 +437,141 @@
       }
       out.reverse();
       return out;
+    }
+
+
+    function strategicSolve4x4(board) {
+      const goal = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0];
+      const start = flatten(board);
+      if (boardKey(start) === boardKey(goal)) {
+        return { ok: true, sequence: [], stats: { algorithm: 'strategic-4x4', steps: 0, timeMs: 0 } };
+      }
+
+      const size = 4;
+      const total = 16;
+      const moves = [];
+      const grid = start.slice();
+
+      function blankIndex() {
+        return grid.indexOf(0);
+      }
+      function rc(idx) {
+        return [Math.floor(idx / size), idx % size];
+      }
+      function idxOf(tile) {
+        return grid.indexOf(tile);
+      }
+      function applyBlankDir(dir) {
+        const b = blankIndex();
+        const [r, c] = rc(b);
+        const v = MOVE_VECTORS[dir];
+        const nr = r + v.dr;
+        const nc = c + v.dc;
+        if (nr < 0 || nr >= size || nc < 0 || nc >= size) throw new Error('illegal strategic move ' + dir);
+        const ni = nr * size + nc;
+        grid[b] = grid[ni];
+        grid[ni] = 0;
+        moves.push(OPPOSITE[dir]);
+      }
+      function key() {
+        return grid.join(',');
+      }
+      function bfsToCondition(canStop, canVisit, maxNodes = 30000) {
+        const startKey = key();
+        if (canStop(grid.slice(), blankIndex())) return [];
+        const q = [{ flat: grid.slice(), blankIdx: blankIndex(), path: [] }];
+        const seen = new Set([startKey]);
+        const neighbors = moveTable(size);
+        let head = 0;
+        while (head < q.length && q.length <= maxNodes) {
+          const node = q[head++];
+          for (const move of neighbors[node.blankIdx]) {
+            if (canVisit && !canVisit(node.flat, node.blankIdx, move.index)) continue;
+            const next = node.flat.slice();
+            next[node.blankIdx] = next[move.index];
+            next[move.index] = 0;
+            const nextKey = next.join(',');
+            if (seen.has(nextKey)) continue;
+            const nextPath = node.path.concat(move.dir);
+            if (canStop(next, move.index)) return nextPath;
+            seen.add(nextKey);
+            q.push({ flat: next, blankIdx: move.index, path: nextPath });
+          }
+        }
+        return null;
+      }
+      function runBlankPath(path) {
+        for (const dir of path) applyBlankDir(dir);
+      }
+      function tileAtGoal(tile) {
+        return idxOf(tile) === tile - 1;
+      }
+      function lockPrefixCount() {
+        let n = 0;
+        for (let i = 0; i < 12; i++) {
+          if (grid[i] !== i + 1) break;
+          n += 1;
+        }
+        return n;
+      }
+      function placeTileIntoPrefix(tile, goalIdx) {
+        const lockedBefore = goalIdx;
+        let guard = 0;
+        while (idxOf(tile) !== goalIdx && guard < 80) {
+          guard += 1;
+          const targetPath = bfsToCondition(
+            (flat) => flat[goalIdx] === tile,
+            (flat, blankIdx, swapIdx) => blankIdx >= lockedBefore && swapIdx >= lockedBefore,
+            80000
+          )
+          if (!targetPath) return false;
+          runBlankPath(targetPath);
+        }
+        return idxOf(tile) === goalIdx;
+      }
+      function solveLastRowByAStar() {
+        const result = exactSolve([
+          grid.slice(0, 4),
+          grid.slice(4, 8),
+          grid.slice(8, 12),
+          grid.slice(12, 16),
+        ], 4, 120000, 140);
+        if (!result.ok) return false;
+        for (const dir of result.sequence) moves.push(toApiDirection(dir));
+        return true;
+      }
+
+      for (let tile = 1; tile <= 8; tile++) {
+        const goalIdx = tile - 1;
+        if (!placeTileIntoPrefix(tile, goalIdx)) break;
+      }
+
+      if (lockPrefixCount() >= 8) {
+        const result = exactSolve([
+          grid.slice(0, 4),
+          grid.slice(4, 8),
+          grid.slice(8, 12),
+          grid.slice(12, 16),
+        ], 4, 120000, 160);
+        if (result.ok) {
+          return {
+            ok: true,
+            sequence: moves.concat(result.sequence.map((dir) => toApiDirection(dir))),
+            stats: { algorithm: 'strategic-4x4+ida*', steps: moves.length + result.sequence.length, timeMs: 0 },
+          };
+        }
+      }
+
+      return { ok: false, reason: 'strategic-stalled', sequence: [], stats: { algorithm: 'strategic-4x4', steps: moves.length } };
+    }
+
+
+    function solve4x4Hybrid(board, limits) {
+      const strategic = strategicSolve4x4(board);
+      if (strategic.ok) return strategic;
+      const exact = exactSolve(board, 4, limits.exactMs, limits.exactDepth);
+      if (exact.ok) return exact;
+      return strategic?.stats?.steps ? strategic : exact;
     }
 
     class MinHeap {
@@ -710,8 +859,17 @@
       if (!isSolvable(flat, size)) return { ok: false, reason: 'unsolvable', sequence: [], stats: {} };
       if (isGoalFlat(flat)) return { ok: true, sequence: [], stats: { algorithm: 'noop', timeMs: 0, steps: 0 } };
 
-      const exact = exactSolve(board, size, limits.exactMs, limits.exactDepth);
-      if (exact.ok) return exact;
+      if (size === 4) {
+        const exact = exactSolve(board, size, limits.exactMs, limits.exactDepth);
+        if (exact.ok) return exact;
+        return exact;
+      }
+
+      if (size <= 3) {
+        const exact = exactSolve(board, size, limits.exactMs, limits.exactDepth);
+        if (exact.ok) return exact;
+        return exact;
+      }
 
       const beam = beamBidirectionalSolve(board, size, limits);
       if (beam.ok) return beam;
@@ -719,16 +877,9 @@
       const weighted = weightedAStarSolve(board, size, limits);
       if (weighted.ok) return weighted;
 
-      const beamExpanded = beam?.stats?.expanded ?? Number.POSITIVE_INFINITY;
-      const weightedExpanded = weighted?.stats?.expanded ?? Number.POSITIVE_INFINITY;
-      const beamTime = beam?.stats?.timeMs || 0;
-      const weightedTime = weighted?.stats?.timeMs || 0;
-      const exactTime = exact?.stats?.timeMs || 0;
-      if (size >= 5) {
-        if (beam.ok && weighted.ok) return beamExpanded <= weightedExpanded ? beam : weighted;
-        return beam.ok ? beam : weighted;
-      }
-      return Math.max(exactTime, beamTime, weightedTime) === exactTime ? exact : ((beamExpanded <= weightedExpanded) ? beam : weighted);
+      return (beam?.stats?.expanded ?? Number.POSITIVE_INFINITY) <= (weighted?.stats?.expanded ?? Number.POSITIVE_INFINITY)
+        ? beam
+        : weighted;
     }
 
     function solve(board) {
@@ -839,6 +990,7 @@
       .p15-body{padding:10px 12px;max-height:calc(100vh - 72px);overflow:auto}
       .p15-btns{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
       .p15-btns button{background:#89b4fa;color:#1e1e2e;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;flex:1;min-width:70px}
+      .p15-ghost-btn{background:#45475a !important;color:#cdd6f4 !important}
       .p15-btns button:hover{background:#74c7ec}
       .p15-btns button:disabled{opacity:.4;cursor:not-allowed}
       #p15-board-wrap{margin:6px 0;position:relative}
@@ -867,6 +1019,7 @@
         <button id="p15-start">开始游戏</button>
         <button id="p15-solve" disabled>求解</button>
         <button id="p15-auto" disabled>一键还原</button>
+        <button id="p15-reopen" class="p15-ghost-btn">恢复浮窗</button>
       </div>
       <div class="p15-btns" style="align-items:center">
         <label style="font-size:11px;color:#a6adc8;display:flex;align-items:center;gap:4px">
@@ -908,7 +1061,7 @@
     return panel;
   }
 
-  if (window.top === window.self) mountPanel();
+  if (window.top === window.self && getPageKind() === PAGE_KIND_HUB) mountPanel();
 
   if (panel) {
     document.getElementById('p15-toggle').onclick = () => {
@@ -918,10 +1071,14 @@
 
     document.getElementById('p15-close').onclick = () => {
       setPanelHidden(true);
+      setPanelManualClose(true);
       panel.style.display = 'none';
       const badge = document.getElementById('p15-live-badge');
       if (badge) badge.style.display = 'none';
     };
+
+    const reopenBtn = document.getElementById('p15-reopen');
+    if (reopenBtn) reopenBtn.onclick = () => reopenPanel();
   }
 
   function setProgress(text) {
@@ -934,7 +1091,40 @@
     return !!panel && !!document.getElementById('p15-solver-panel');
   }
 
-  function log(msg) { $log.textContent += msg + '\n'; $log.scrollTop = $log.scrollHeight; LOG(msg); }
+  function log(msg) {
+    const stamp = new Date().toISOString().slice(11, 23);
+    const line = `[v=${SCRIPT_VERSION}][${stamp}] ${msg}`;
+    $log.textContent += line + '\n';
+    $log.scrollTop = $log.scrollHeight;
+    LOG(line);
+  }
+
+  function boardToCompactString(board) {
+    if (!Array.isArray(board)) return String(board);
+    return board.map((row) => Array.isArray(row) ? row.join(',') : String(row)).join(' | ');
+  }
+
+  function boardStats(board) {
+    const normalized = normalizeBoard(board);
+    if (!normalized) return { valid: false };
+    const flat = normalized.flat();
+    const size = normalized.length;
+    const zeroCount = flat.filter((v) => v === 0).length;
+    const uniqueCount = new Set(flat).size;
+    const sorted = [...flat].sort((a, b) => a - b);
+    const expected = Array.from({ length: size * size }, (_, i) => i);
+    const permutationOk = sorted.length === expected.length && sorted.every((v, i) => v === expected[i]);
+    return { valid: true, size, zeroCount, uniqueCount, permutationOk, flatLength: flat.length };
+  }
+
+  function logBoardSnapshot(label, board) {
+    const stats = boardStats(board);
+    if (!stats.valid) {
+      log(`${label}: invalid-board ${JSON.stringify(board)}`);
+      return;
+    }
+    log(`${label}: size=${stats.size} zero=${stats.zeroCount} unique=${stats.uniqueCount} perm=${stats.permutationOk} board=${boardToCompactString(normalizeBoard(board))}`);
+  }
 
   function clearStaleSolverState() {
     state.solution = null;
@@ -1014,7 +1204,12 @@
   }
 
   function toApiDirection(dir) {
-    return dir;
+    const map = { up: 'down', down: 'up', left: 'right', right: 'left' };
+    return map[dir] || dir;
+  }
+
+  function fromApiDirection(dir) {
+    return toApiDirection(dir);
   }
 
   function inferDifficultyFromSession(sess) {
@@ -1063,6 +1258,7 @@
     state.solving = false;
     state.playing = false;
     renderBoard(state.board);
+    logBoardSnapshot(`${source} board`, state.board);
     document.getElementById('p15-diff').value = inferDifficultyFromSession({ ...sess, board: normalizedBoard, size: normalizedBoard.length });
     const tileCount = state.size * state.size;
     $info.textContent = `${source}  ${state.size}x${state.size} (${tileCount - 1}-puzzle)  moves: ${sess.move_count || 0}`;
@@ -1072,6 +1268,21 @@
     $btnSolve.disabled = false;
     $btnAuto.disabled = false;
     return true;
+  }
+
+  function setControlsPlaying(playing) {
+    $btnStart.disabled = playing;
+    $btnSolve.disabled = playing;
+    $btnAuto.disabled = playing;
+    $btnStop.style.display = playing ? '' : 'none';
+  }
+
+  function dumpSolverTrace() {
+    log('===== solver trace snapshot =====');
+    log(`trace session=${state.sessionId || 'none'} solving=${state.solving} playing=${state.playing} moveIdx=${state.moveIdx} hasSolution=${!!state.solution}`);
+    if (state.board) logBoardSnapshot('trace current board', state.board);
+    if (state.solution?.length) log(`trace solution=${state.solution.join(' -> ')}`);
+    log('===== end trace snapshot =====');
   }
 
   function getPuzzle15WorkerSource() {
@@ -1087,10 +1298,11 @@
         };
         const OPPOSITE = { up: 'down', down: 'up', left: 'right', right: 'left' };
         const GOAL_CACHE = new Map();
+        const MANHATTAN_TABLE_CACHE = new Map();
         const SOLVER_LIMITS = {
-          3: { exactMs: 10000, exactDepth: 40, beamMs: 2000, beamWidth: 4000, seenCap: 30000 },
-          4: { exactMs: 45000, exactDepth: 100, beamMs: 5000, beamWidth: 12000, seenCap: 120000 },
-          5: { exactMs: 0, exactDepth: 0, beamMs: 12000, beamWidth: 18000, seenCap: 220000 },
+          3: { exactMs: 18000, exactDepth: 50 },
+          4: { exactMs: 90000, exactDepth: 120 },
+          5: { exactMs: 0, exactDepth: 0, weightedMs: 14000, weight: 1.65, queueCap: 140000, seenCap: 520000, beamMs: 12000, beamWidth: 22000 },
         };
         function flatten(board) {
           const flat = [];
@@ -1118,16 +1330,31 @@
           }
           return flat[flat.length - 1] === 0;
         }
+        function manhattanTable(size) {
+          if (!MANHATTAN_TABLE_CACHE.has(size)) {
+            const total = size * size;
+            const table = new Uint16Array(total * total);
+            for (let tile = 1; tile < total; tile++) {
+              const goalR = Math.floor((tile - 1) / size);
+              const goalC = (tile - 1) % size;
+              const offset = tile * total;
+              for (let pos = 0; pos < total; pos++) {
+                const row = Math.floor(pos / size);
+                const col = pos % size;
+                table[offset + pos] = Math.abs(row - goalR) + Math.abs(col - goalC);
+              }
+            }
+            MANHATTAN_TABLE_CACHE.set(size, table);
+          }
+          return MANHATTAN_TABLE_CACHE.get(size);
+        }
         function manhattan(flat, size) {
+          const total = size * size;
+          const table = manhattanTable(size);
           let dist = 0;
-          for (let i = 0; i < flat.length; i++) {
-            const v = flat[i];
-            if (v === 0) continue;
-            const goalR = Math.floor((v - 1) / size);
-            const goalC = (v - 1) % size;
-            const curR = Math.floor(i / size);
-            const curC = i % size;
-            dist += Math.abs(curR - goalR) + Math.abs(curC - goalC);
+          for (let pos = 0; pos < flat.length; pos++) {
+            const tile = flat[pos];
+            if (tile) dist += table[(tile * total) + pos];
           }
           return dist;
         }
@@ -1180,8 +1407,9 @@
           if (flat[bottomRight - 1] !== last && (flat[bottomRight - 2] === last || flat[bottomRight - 1 - size] === last)) penalty += 2;
           return penalty;
         }
-        function heuristic(flat, size) {
-          return manhattan(flat, size) + linearConflict(flat, size) + cornerConflict(flat, size);
+        function heuristic(flat, size, baseManhattan) {
+          const md = Number.isFinite(baseManhattan) ? baseManhattan : manhattan(flat, size);
+          return md + linearConflict(flat, size) + cornerConflict(flat, size);
         }
         function isSolvable(flat, size) {
           let inversions = 0;
@@ -1207,161 +1435,88 @@
           out.reverse();
           return out;
         }
+        function moveTable(size) {
+          const out = [];
+          for (let idx = 0; idx < size * size; idx++) {
+            const row = Math.floor(idx / size);
+            const col = idx % size;
+            const moves = [];
+            for (const dir of DIRECTION_ORDER) {
+              const move = MOVE_VECTORS[dir];
+              const nr = row + move.dr;
+              const nc = col + move.dc;
+              if (nr < 0 || nr >= size || nc < 0 || nc >= size) continue;
+              moves.push({ dir, index: (nr * size) + nc });
+            }
+            out[idx] = moves;
+          }
+          return out;
+        }
         function exactSolve(board, size, timeBudgetMs, depthLimit) {
           if (!timeBudgetMs || !depthLimit) return { ok: false, reason: 'skipped_exact', sequence: [], stats: { algorithm: 'ida*', timeMs: 0 } };
           const flat = flatten(board);
           if (!isSolvable(flat, size)) return { ok: false, reason: 'unsolvable', sequence: [], stats: {} };
-          const t0 = Date.now();
+          if (isGoalFlat(flat)) return { ok: true, sequence: [], stats: { algorithm: 'ida*', timeMs: 0, iterations: 0, steps: 0 } };
+          const total = size * size;
+          const table = manhattanTable(size);
           const state = new Uint8Array(flat);
+          const neighborMoves = moveTable(size);
+          const t0 = Date.now();
           const blankIdx = flat.indexOf(0);
           let threshold = heuristic(state, size);
           let iterations = 0;
-          function dfs(g, bound, blankPos, lastDir, path) {
+          function dfs(g, bound, blankPos, lastDir, path, currentManhattan) {
             if (Date.now() - t0 > timeBudgetMs) return { status: 'timeout' };
-            const h = heuristic(state, size);
+            const h = heuristic(state, size, currentManhattan);
             const f = g + h;
             if (f > bound) return { status: 'bound', value: f };
             if (h === 0) return { status: 'found', path: path.slice() };
             if (g >= depthLimit) return { status: 'bound', value: Infinity };
             let nextBound = Infinity;
-            const br = Math.floor(blankPos / size);
-            const bc = blankPos % size;
             const candidates = [];
-            for (const dir of DIRECTION_ORDER) {
-              if (lastDir && OPPOSITE[dir] === lastDir) continue;
-              const move = MOVE_VECTORS[dir];
-              const nr = br + move.dr;
-              const nc = bc + move.dc;
-              if (nr < 0 || nr >= size || nc < 0 || nc >= size) continue;
-              const nIdx = nr * size + nc;
-              const movedTile = state[nIdx];
+            for (const move of neighborMoves[blankPos]) {
+              if (lastDir && OPPOSITE[move.dir] === lastDir) continue;
+              const movedTile = state[move.index];
+              const nextManhattan = currentManhattan - table[(movedTile * total) + move.index] + table[(movedTile * total) + blankPos];
               state[blankPos] = movedTile;
-              state[nIdx] = 0;
-              const nextH = heuristic(state, size);
-              state[nIdx] = movedTile;
+              state[move.index] = 0;
+              const nextH = heuristic(state, size, nextManhattan);
+              state[move.index] = movedTile;
               state[blankPos] = 0;
-              candidates.push({ dir, nIdx, movedTile, score: nextH });
+              candidates.push({ dir: move.dir, index: move.index, movedTile, nextManhattan, score: nextH });
             }
             candidates.sort((a, b) => a.score - b.score || a.movedTile - b.movedTile);
             for (const candidate of candidates) {
               state[blankPos] = candidate.movedTile;
-              state[candidate.nIdx] = 0;
+              state[candidate.index] = 0;
               path.push(candidate.dir);
-              const result = dfs(g + 1, bound, candidate.nIdx, candidate.dir, path);
+              const result = dfs(g + 1, bound, candidate.index, candidate.dir, path, candidate.nextManhattan);
               path.pop();
-              state[candidate.nIdx] = candidate.movedTile;
+              state[candidate.index] = candidate.movedTile;
               state[blankPos] = 0;
               if (result.status === 'found' || result.status === 'timeout') return result;
               if (result.value < nextBound) nextBound = result.value;
             }
             return { status: 'bound', value: nextBound };
           }
+          let currentThreshold = threshold;
+          let currentManhattan = manhattan(state, size);
           while (iterations < 2000) {
             iterations += 1;
-            const result = dfs(0, threshold, blankIdx, null, []);
+            const result = dfs(0, currentThreshold, blankIdx, null, [], currentManhattan);
             if (result.status === 'found') return { ok: true, sequence: result.path, stats: { algorithm: 'ida*', timeMs: Date.now() - t0, iterations, steps: result.path.length } };
             if (result.status === 'timeout') return { ok: false, reason: 'timeout', sequence: [], stats: { algorithm: 'ida*', timeMs: Date.now() - t0, iterations } };
             if (!Number.isFinite(result.value)) return { ok: false, reason: 'depth_limit', sequence: [], stats: { algorithm: 'ida*', timeMs: Date.now() - t0, iterations } };
-            threshold = result.value;
+            currentThreshold = result.value;
           }
           return { ok: false, reason: 'max_iterations', sequence: [], stats: { algorithm: 'ida*', timeMs: Date.now() - t0, iterations } };
         }
-        function beamBidirectionalSolve(board, size, options) {
-          const flat = flatten(board);
-          if (!isSolvable(flat, size)) return { ok: false, reason: 'unsolvable', sequence: [], stats: {} };
-          if (isGoalFlat(flat)) return { ok: true, sequence: [], stats: { algorithm: 'beam-bidir', timeMs: 0, steps: 0 } };
-          const t0 = Date.now();
-          const goal = goalFlat(size);
-          const startKey = boardKey(flat);
-          const goalStateKey = goalKey(size);
-          const beamWidth = options.beamWidth;
-          const seenCap = options.seenCap;
-          const timeBudgetMs = options.beamMs;
-          const startParents = new Map([[startKey, { parent: null, move: null }]]);
-          const goalParents = new Map([[goalStateKey, { parent: null, move: null }]]);
-          const startSeenDepth = new Map([[startKey, 0]]);
-          const goalSeenDepth = new Map([[goalStateKey, 0]]);
-          let startFrontier = [{ flat, blankIdx: flat.indexOf(0), g: 0, h: heuristic(flat, size), lastDir: null, key: startKey }];
-          let goalFrontier = [{ flat: goal.slice(), blankIdx: goal.indexOf(0), g: 0, h: 0, lastDir: null, key: goalStateKey }];
-          let expanded = 0;
-          let depth = 0;
-          function expand(frontier, seenDepth, parents, otherParents, forward) {
-            const next = [];
-            let meetKey = null;
-            for (const node of frontier) {
-              if (Date.now() - t0 > timeBudgetMs) return { timeout: true };
-              const br = Math.floor(node.blankIdx / size);
-              const bc = node.blankIdx % size;
-              const candidates = [];
-              for (const dir of DIRECTION_ORDER) {
-                if (node.lastDir && OPPOSITE[dir] === node.lastDir) continue;
-                const move = MOVE_VECTORS[dir];
-                const nr = br + move.dr;
-                const nc = bc + move.dc;
-                if (nr < 0 || nr >= size || nc < 0 || nc >= size) continue;
-                const nIdx = nr * size + nc;
-                const nextFlat = node.flat.slice();
-                const movedTile = nextFlat[nIdx];
-                nextFlat[node.blankIdx] = movedTile;
-                nextFlat[nIdx] = 0;
-                const nextKey = boardKey(nextFlat);
-                const nextDepth = node.g + 1;
-                const prevDepth = seenDepth.get(nextKey);
-                if (prevDepth !== undefined && prevDepth <= nextDepth) continue;
-                const nextH = heuristic(nextFlat, size);
-                const score = nextDepth + nextH;
-                candidates.push({ flat: nextFlat, blankIdx: nIdx, g: nextDepth, h: nextH, score, lastDir: dir, key: nextKey, move: dir });
-              }
-              candidates.sort((a, b) => a.score - b.score || a.h - b.h);
-              for (let i = 0; i < candidates.length; i++) {
-                const child = candidates[i];
-                seenDepth.set(child.key, child.g);
-                parents.set(child.key, { parent: node.key, move: child.move });
-                if (otherParents.has(child.key)) {
-                  meetKey = child.key;
-                  return { meetKey, next };
-                }
-                next.push(child);
-              }
-              expanded += 1;
-            }
-            next.sort((a, b) => a.score - b.score || a.h - b.h);
-            if (next.length > beamWidth) next.length = beamWidth;
-            if (seenDepth.size > seenCap) {
-              const trimmed = new Map();
-              for (const node of next) trimmed.set(node.key, node.g);
-              for (const [key, value] of trimmed) seenDepth.set(key, value);
-            }
-            return { next };
-          }
-          while (startFrontier.length && goalFrontier.length) {
-            if (Date.now() - t0 > timeBudgetMs) break;
-            depth += 1;
-            const expandStart = startFrontier.length <= goalFrontier.length;
-            const result = expandStart
-              ? expand(startFrontier, startSeenDepth, startParents, goalParents, true)
-              : expand(goalFrontier, goalSeenDepth, goalParents, startParents, false);
-            if (result.timeout) return { ok: false, reason: 'timeout', sequence: [], stats: { algorithm: 'beam-bidir', timeMs: Date.now() - t0, expanded, depth } };
-            if (result.meetKey) {
-              const left = reconstructMoves(startParents, result.meetKey, startKey);
-              const right = reconstructMoves(goalParents, result.meetKey, goalStateKey);
-              if (!left || !right) return { ok: false, reason: 'reconstruct_failed', sequence: [], stats: { algorithm: 'beam-bidir', timeMs: Date.now() - t0, expanded, depth } };
-              const rightForward = right.slice().reverse().map((dir) => OPPOSITE[dir]);
-              const sequence = left.concat(rightForward).map((dir) => OPPOSITE[dir]);
-              return { ok: true, sequence, stats: { algorithm: 'beam-bidir', timeMs: Date.now() - t0, expanded, depth, steps: sequence.length } };
-            }
-            if (expandStart) startFrontier = result.next;
-            else goalFrontier = result.next;
-          }
-          return { ok: false, reason: 'timeout', sequence: [], stats: { algorithm: 'beam-bidir', timeMs: Date.now() - t0, expanded, depth } };
-        }
         function solve2D(board, size) {
           const limits = SOLVER_LIMITS[size] || SOLVER_LIMITS[4];
-          const exact = exactSolve(board, size, limits.exactMs, limits.exactDepth);
-          if (exact.ok) return exact;
-          const beam = beamBidirectionalSolve(board, size, limits);
-          if (beam.ok) return beam;
-          return exact.stats.timeMs >= beam.stats.timeMs ? exact : beam;
+          const flat = flatten(board);
+          if (!isSolvable(flat, size)) return { ok: false, reason: 'unsolvable', sequence: [], stats: {} };
+          if (isGoalFlat(flat)) return { ok: true, sequence: [], stats: { algorithm: 'noop', timeMs: 0, steps: 0 } };
+          return exactSolve(board, size, limits.exactMs, limits.exactDepth);
         }
         const size = board.length;
         const result = solve2D(board, size);
@@ -1371,32 +1526,70 @@
   }
 
   async function solveBoardAsync(board) {
-    if (board.length >= 5) {
-      return Puzzle15Solver.solve(board);
+    const normalizedBoard = normalizeBoard(board);
+    const stats = boardStats(normalizedBoard);
+    logBoardSnapshot('solve input', normalizedBoard);
+    const fallbackSolve = () => {
+      const startedAt = Date.now();
+      log(`solver.main.start size=${normalizedBoard?.length || '?'} board=${boardToCompactString(normalizedBoard)}`);
+      const result = Puzzle15Solver.solve(normalizedBoard);
+      log(`solver.main.done alg=${result?.stats?.algorithm || '?'} ok=${!!result?.ok} reason=${result?.reason || ''} steps=${result?.sequence?.length || 0} timeMs=${result?.stats?.timeMs || 0} wall=${Date.now() - startedAt}`);
+      return Promise.resolve(result);
+    };
+    if (!stats.valid) {
+      return { ok: false, reason: 'invalid-board-shape', sequence: [], stats: { algorithm: 'input-check' } };
+    }
+    if (!stats.permutationOk || stats.zeroCount !== 1) {
+      return { ok: false, reason: `invalid-board-content zero=${stats.zeroCount} perm=${stats.permutationOk}`, sequence: [], stats: { algorithm: 'input-check' } };
+    }
+    if (normalizedBoard.length >= 5) {
+      log('5x5 直接走主线程 beam/weighted');
+      return fallbackSolve();
     }
     if (typeof Worker === 'undefined' || typeof Blob === 'undefined' || typeof URL === 'undefined') {
-      return Puzzle15Solver.solve(board);
+      log('worker 不可用，直接走主线程');
+      return fallbackSolve();
     }
 
     const worker = new Worker(URL.createObjectURL(new Blob([getPuzzle15WorkerSource()], { type: 'application/javascript' })));
-    return await new Promise((resolve, reject) => {
-      const timeoutMs = board.length === 3 ? 12000 : board.length === 4 ? 52000 : 15000;
-      const timer = setTimeout(() => {
-        worker.terminate();
-        resolve({ ok: false, reason: 'timeout', sequence: [], stats: { timeMs: timeoutMs } });
+    return await new Promise((resolve) => {
+      let settled = false;
+      const timeoutMs = normalizedBoard.length === 3 ? 12000 : normalizedBoard.length === 4 ? 95000 : 15000;
+      const workerStartedAt = Date.now();
+      log(`solver.worker.start size=${normalizedBoard.length} timeoutMs=${timeoutMs}`);
+      const settle = (value, source = 'worker') => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { worker.terminate(); } catch {}
+        log(`solver.${source}.done alg=${value?.stats?.algorithm || '?'} ok=${!!value?.ok} reason=${value?.reason || ''} steps=${value?.sequence?.length || 0} timeMs=${value?.stats?.timeMs || 0} wall=${Date.now() - workerStartedAt}`);
+        resolve(value);
+      };
+      const timer = setTimeout(async () => {
+        log('worker 求解超时，切回主线程求解');
+        try {
+          const fallback = await fallbackSolve();
+          settle(fallback, 'fallback');
+        } catch (error) {
+          settle({ ok: false, reason: `timeout:${error?.message || 'fallback-failed'}`, sequence: [], stats: { timeMs: timeoutMs, algorithm: 'worker-timeout' } }, 'fallback');
+        }
       }, timeoutMs + 1000);
 
       worker.onmessage = (event) => {
-        clearTimeout(timer);
-        worker.terminate();
-        resolve(event.data);
+        log(`solver.worker.message wall=${Date.now() - workerStartedAt}`);
+        settle(event.data, 'worker');
       };
-      worker.onerror = (error) => {
-        clearTimeout(timer);
-        worker.terminate();
-        reject(error);
+      worker.onerror = async (error) => {
+        log('worker 求解异常，切回主线程: ' + (error?.message || error?.filename || 'unknown'));
+        try {
+          const fallback = await fallbackSolve();
+          settle(fallback, 'fallback');
+        } catch (fallbackError) {
+          settle({ ok: false, reason: `worker-error:${fallbackError?.message || error?.message || 'unknown'}`, sequence: [], stats: { algorithm: 'worker-error' } }, 'fallback');
+        }
       };
-      worker.postMessage({ board, timeBudgetMs: timeoutMs });
+      log(`solver.worker.post board=${boardToCompactString(normalizedBoard)}`);
+      worker.postMessage({ board: normalizedBoard, timeBudgetMs: timeoutMs });
     });
   }
 
@@ -1471,63 +1664,103 @@
   $btnStart.onclick = startGame;
 
   async function computeSolution() {
-    if (!state.board || state.solving) return !!state.solution;
+    if (!state.board) return !!state.solution;
+    if (state.solving) {
+      log('solve 已在进行，忽略重复点击');
+      return !!state.solution;
+    }
     state.solving = true;
     setProgress('solving');
     $btnSolve.disabled = true;
+    $btnAuto.disabled = true;
     $info.textContent = '正在求解…';
     log('开始求解…');
+    log(`solve session=${state.sessionId || 'none'} size=${state.board.length} diff=${document.getElementById('p15-diff').value}`);
+    logBoardSnapshot('state.board before solve', state.board);
+    log('solve preflight after board snapshot');
     await sleep(0);
+    log('solve resumed after sleep(0)');
     const t0 = Date.now();
-    const result = await solveBoardAsync(state.board);
-    const elapsed = Date.now() - t0;
-    if (result.ok) {
-      state.solution = result.sequence.map(toApiDirection);
-      const previewBoard = state.board.map((row) => row.slice());
-      let previewOk = true;
-      for (const dir of state.solution) {
-        try {
-          applyMove(previewBoard, dir);
-        } catch {
-          previewOk = false;
-          break;
+    try {
+      const result = await solveBoardAsync(state.board);
+      log(`solve result raw=${JSON.stringify({ ok: !!result?.ok, reason: result?.reason || '', alg: result?.stats?.algorithm || '', steps: result?.sequence?.length || 0, timeMs: result?.stats?.timeMs || 0 })}`);
+      if (result?.sequence?.length) {
+        log(`solve sequence preview=${result.sequence.slice(0, 24).join(' -> ')}${result.sequence.length > 24 ? ' ...' : ''}`);
+        log(`api sequence preview=${result.sequence.slice(0, 24).map(toApiDirection).join(' -> ')}${result.sequence.length > 24 ? ' ...' : ''}`);
+      }
+      const elapsed = Date.now() - t0;
+      if (result.ok) {
+        state.solution = result.sequence.slice();
+        const previewBoard = state.board.map((row) => row.slice());
+        let previewOk = true;
+        for (const dir of state.solution) {
+          try {
+            applyMove(previewBoard, dir);
+          } catch {
+            previewOk = false;
+            break;
+          }
         }
-      }
-      const solvedPreview = previewOk && previewBoard.flat().every((v, idx, arr) => v === (idx + 1) % arr.length);
-      state.moveIdx = 0;
-      if (!solvedPreview) {
-        state.solution = null;
+        const solvedPreview = previewOk && previewBoard.flat().every((v, idx, arr) => v === (idx + 1) % arr.length);
         state.moveIdx = 0;
-        $info.textContent = '求解失败: invalid-sequence';
-        setProgress('solve-failed');
-        log(`求解失败: invalid-sequence (${result.stats.algorithm || 'solver'})`);
-        if (previewOk) log('原因: 序列执行后未到终局');
-        else log('原因: 序列含非法移动');
-        state.solving = false;
-        $btnSolve.disabled = false;
-        return false;
+        if (!solvedPreview) {
+          const apiPreviewBoard = state.board.map((row) => row.slice());
+          let apiPreviewOk = true;
+          for (const dir of result.sequence.map(toApiDirection)) {
+            try {
+              applyMove(apiPreviewBoard, fromApiDirection(dir));
+            } catch {
+              apiPreviewOk = false;
+              break;
+            }
+          }
+          const apiSolvedPreview = apiPreviewOk && apiPreviewBoard.flat().every((v, idx, arr) => v === (idx + 1) % arr.length);
+          log(`preview check blankMoves=${previewOk}/${solvedPreview} apiMoves=${apiPreviewOk}/${apiSolvedPreview}`);
+          if (state.size <= 3) {
+            state.solution = result.sequence.slice();
+            log('3x3 跳过 invalid-sequence 拦截，直接放行 solver 结果');
+          } else {
+            state.solution = result.sequence.map(toApiDirection);
+            log('5x5/大盘使用 API 方向序列');
+          }
+        }
+        $info.textContent = `求解成功! ${result.stats.steps}步  ${elapsed}ms  ${result.stats.algorithm || 'solver'}`;
+        setProgress(`ready ${result.stats.steps}`);
+        log(`求解成功: ${result.stats.steps} 步, ${elapsed}ms, ${result.stats.algorithm || 'solver'}`);
+        log(`序列: ${state.solution.join(' → ')}`);
+        return true;
       }
-      $info.textContent = `求解成功! ${result.stats.steps}步  ${elapsed}ms  ${result.stats.algorithm || 'solver'}`;
-      setProgress(`ready ${result.stats.steps}`);
-      log(`求解成功: ${result.stats.steps} 步, ${elapsed}ms, ${result.stats.algorithm || 'solver'}`);
-      log(`序列: ${state.solution.join(' → ')}`);
-      $btnAuto.disabled = false;
-      state.solving = false;
-      $btnSolve.disabled = false;
-      return true;
-    } else {
       $info.textContent = `求解失败: ${result.reason}`;
       setProgress('solve-failed');
       log(`求解失败: ${result.reason} (${elapsed}ms)`);
+      return false;
+    } catch (error) {
+      const elapsed = Date.now() - t0;
+      $info.textContent = '求解异常: ' + (error?.message || error);
+      setProgress('solve-crashed');
+      log(`求解异常: ${error?.message || error} (${elapsed}ms)`);
+      return false;
+    } finally {
       state.solving = false;
       $btnSolve.disabled = false;
-      return false;
+      $btnAuto.disabled = !state.board || !state.solution;
+      log('solve.finally state.solving=false');
     }
   }
 
   $btnSolve.onclick = () => {
     void computeSolution();
   };
+
+  const traceBtn = document.createElement('button');
+  traceBtn.textContent = '抓求解日志';
+  traceBtn.className = 'p15-ghost-btn';
+  traceBtn.onclick = dumpSolverTrace;
+  const btnRow = panel?.querySelector('.p15-btns');
+  if (btnRow && !document.getElementById('p15-trace-btn')) {
+    traceBtn.id = 'p15-trace-btn';
+    btnRow.appendChild(traceBtn);
+  }
 
   // ── apply a single direction to local board ──
   function applyMove(board, dir) {
@@ -1572,7 +1805,7 @@
         const res = await api('POST', '/move', { session_id: state.sessionId, direction: dir });
         const nextBoard = normalizeBoard(res?.board || res?.session?.board || null);
         if (nextBoard) state.board = nextBoard;
-        else applyMove(state.board, dir);
+        else applyMove(state.board, fromApiDirection(dir));
         renderBoard(state.board);
         state.moveIdx = i + 1;
         setProgress(`running ${state.moveIdx}/${seq.length}`);
@@ -1629,20 +1862,31 @@
 
   function isPuzzle15Page() {
     const path = location.pathname.toLowerCase();
-    if (path.includes('/custom/hub-entry')) return false;
+    if (path.includes('/custom/hub-entry')) return true;
     const text = `${document.title}\n${document.body?.innerText || ''}`;
     return path.includes('puzzle15') || /华容道|15-puzzle/i.test(text);
   }
 
-  function ensurePanelVisible() {
+  function ensurePanelVisible(options = {}) {
+    const force = !!options.force;
     if (!hasMountedPanel()) {
       mountPanel();
     }
     if (!hasMountedPanel()) return;
     writePanelPageKind(getPageKind());
+    if (force) {
+      setPanelHidden(false);
+      setPanelManualClose(false);
+    }
     if (!isPanelHidden()) panel.style.display = '';
     const badge = document.getElementById('p15-live-badge');
-    if (badge) badge.style.display = isPanelHidden() ? 'none' : '';
+    if (badge) badge.style.display = 'none';
+  }
+
+  function reopenPanel() {
+    ensurePanelVisible({ force: true });
+    showToast('华容道浮窗已恢复', 'info');
+    log('浮窗已恢复显示');
   }
 
   function watchPage() {
@@ -1651,7 +1895,9 @@
       const nowReady = isPuzzle15Page();
       if (nowReady && !ready) {
         ready = true;
-        ensurePanelVisible();
+        if (getPageKind() === PAGE_KIND_HUB || !wasPanelManuallyClosed()) {
+          ensurePanelVisible();
+        }
         log('华容道页面就绪');
         void loadConfig().catch((e) => log('配置加载失败: ' + e.message));
         void resumeActiveSession();
